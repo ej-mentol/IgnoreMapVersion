@@ -1,0 +1,38 @@
+# Build output
+Build/
+Debug/
+Release/
+Release_AVX2/
+x64/
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+*.tlog
+*.idb
+*.ipch
+*.pch
+*.res
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# PVS-Studio
+*.plog
+*.suppress
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

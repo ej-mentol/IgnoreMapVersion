@@ -1,0 +1,85 @@
+# IgnoreMapVersion
+
+A standalone MetaHookSv plugin for Sven Co-op designed to bypass client-side BSP map CRC32 mismatch errors while safeguarding against network desynchronization and client crashes.
+
+---
+
+## Background & Problem
+
+When a client connects to a GoldSrc / Sven Co-op dedicated server, the server sends a `svc_serverinfo` network message containing the expected 32-bit CRC checksum of the level BSP. The client engine computes the local file checksum via `CRC_MapFile` and compares the results:
+
+$$\text{Client CRC} \neq \text{Server CRC} \implies \text{Disconnect: "Your map differs from the server's"}$$
+
+In community multiplayer environments, slight map differences are common—such as embedded custom textures, localized entity strings, minor scripting adjustments, or recompilations. Even when these modifications do not alter collision meshes or player interaction, the engine's strict CRC comparison blocks the client from joining.
+
+`IgnoreMapVersion` solves this problem by intercepting the handshake and providing a controlled, structurally-validated CRC override.
+
+---
+
+## How It Works
+
+1. **Server CRC Interception**: During the `svc_serverinfo` network parse routine, the plugin reads the server's expected Map CRC directly from the incoming network buffer (`net_message`).
+2. **Synchronous CRC Hooking**: The engine function `CRC_MapFile` (located dynamically via verified pattern scanning and build-specific RVA resolution) is hooked. When invoked during the active `svc_serverinfo` lifecycle, the plugin intercepts the calculated local CRC.
+3. **Structural Lump Validation**: Before applying any override, the plugin inspects the local BSP file (`ValidateBSPFile`). It verifies file headers and essential geometry lumps (planes, nodes, clipnodes, and leaves). If structural geometry differs in ways that would cause physics prediction faults or memory access violations, the override is aborted.
+4. **State-Gated Override**: If the map passes validation, the plugin replaces the return CRC with the server's expected CRC value. Once `svc_serverinfo` finishes, the active handshake state and cached CRC are immediately reset to prevent stale overrides from affecting subsequent operations.
+
+---
+
+## Configuration & ConVars
+
+All configuration variables are archived in `config.cfg` and prefixed with `imv_`.
+
+| ConVar | Default | Description |
+| :--- | :---: | :--- |
+| `imv_enabled` | `1` | Master toggle (`1` = active, `0` = disabled). |
+| `imv_safety_level` | `1` | Validation rigor mode: <br>• `0` (**Force**): Bypasses all BSP integrity checks. Overrides CRC regardless of geometric differences. Increases risk of physics desync or client crashes.<br>• `1` (**Safe**): Checks BSP geometry lumps prior to override. Aborts override if corrupt or fundamentally incompatible structures are detected.<br>• `2` (**Audit Only**): Telemetry mode. Observes and logs CRC mismatches without modifying the CRC value. Normal engine disconnect will occur. |
+| `imv_log` | `1` | Log output destination: <br>• `0` (**Off**): Disables diagnostic logging.<br>• `1` (**Developer Only**): Prints via `Con_DPrintf`. Messages appear only when `developer` cvar is set to `1` or higher. Keeps console clean for regular gameplay.<br>• `2` (**Console**): Prints directly to standard console (`Con_Printf`). |
+| `imv_log_mode` | `1` | Log filtering policy: <br>• `0` (**Always**): Logs every map verification check, including exact matches.<br>• `1` (**Only Diff**): Logs only when a CRC mismatch or validation event occurs. |
+| `imv_notify` | `1` | Displays an on-screen `CenterPrint` warning alert upon spawning into the map if a CRC mismatch was overridden. |
+
+---
+
+## Console Commands
+
+- `imv_status`: Outputs diagnostic telemetry to the console, including engine build, active hook RVAs, cvar settings, session counters, and details of the most recent map verification.
+- `imv_reset`: Clears session mismatch/override counters and resets the last-checked map telemetry.
+
+---
+
+## Logging Philosophy & Diagnostics
+
+Why are separate logging targets and modes provided?
+
+- **Standard vs. Developer Console (`imv_log`)**: During ordinary gameplay, console output should remain clean for chat, game events, and admin messages. Setting `imv_log 1` ensures diagnostic messages only appear when debugging with `developer 1`. Setting `imv_log 2` makes all actions visible immediately for players troubleshooting connectivity.
+- **Match Filtering (`imv_log_mode`)**: On servers cycling standard maps, CRC matches occur on every transition. Setting `imv_log_mode 1` filters out matching maps, highlighting only instances where the client and server versions diverge.
+
+---
+
+## Safety & Resource Lifecycle
+
+- **Address Resolution**: `CRC_MapFile` is located in two steps — a verified, build-specific RVA is checked first and byte-validated against the full 20-byte signature; if that fails (unknown build), a full `.text` pattern scan runs as fallback, with the same byte-level validation applied to the match before it is ever hooked.
+- **Memory Safety**: Engine data pointers (`msg_readcount`, `net_message`) are validated against engine PE section boundaries (`.data`, `.rdata`, and image bounds) before resolution. Net buffer payload extraction is protected with Structured Exception Handling (`__try ... __except`).
+- **Resource Management**: The plugin does not allocate persistent background threads or heap allocations across map transitions. BSP files opened for validation are closed immediately.
+- **Teardown**: Inline hooks and parse callbacks are cleanly detached in `IPluginsV4::ExitGame` before MetaHook teardown. ConVars and commands are registered into engine linked lists and released upon process termination by the operating system.
+
+---
+
+## Building & Installation
+
+### Requirements
+- Visual Studio 2022 (v143 toolset)
+- Windows SDK 10 / 11
+- Target Architecture: `x86` (`Win32`), C++20 standard
+
+### Build
+1. Open `IgnoreMapVersion.vcxproj` (or the MetaHookSv solution) in Visual Studio.
+2. Select configuration **Release** and platform **Win32**.
+3. Build the project. The output file `IgnoreMapVersion.dll` will be generated in the output directory.
+
+### Installation
+1. Copy `IgnoreMapVersion.dll` to your game directory (e.g., `svencoop/metahook/plugins/`).
+2. Add the plugin entry to `plugins.lst`:
+   ```text
+   IgnoreMapVersion.dll
+   ```
+3. Launch the game and run `imv_status` in the console to verify initialization.
