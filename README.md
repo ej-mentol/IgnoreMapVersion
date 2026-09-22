@@ -112,9 +112,19 @@ You can determine a map's CRC and suggested storage filename at any time using t
 3. Build the project. The output file `IgnoreMapVersion.dll` will be generated in the output directory.
 
 ### Installation
-1. Copy `IgnoreMapVersion.dll` to your game directory (e.g., `svencoop/metahook/plugins/`).
-2. Add the plugin entry to `plugins.lst`:
+1. Extract the release archive directly into your game directory (`svencoop/`):
+   ```text
+   svencoop/
+   ├── ignoremapversion/
+   │   └── aliases.txt
+   └── metahook/
+       └── plugins/
+           ├── IgnoreMapVersion.dll
+           └── IgnoreMapVersion_AVX2.dll
+   ```
+2. Add the plugin entry to `<gamedir>/metahook/configs/plugins.lst`:
    ```text
    IgnoreMapVersion.dll
    ```
-3. Launch the game and run `imv_status` in the console to verify initialization.
+   *(MetaHookSv will automatically load `IgnoreMapVersion_AVX2.dll` if supported by your CPU)*.
+3. Launch the game and type `imv_status` in the console to verify initialization.
