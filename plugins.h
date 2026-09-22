@@ -18,7 +18,7 @@ extern DWORD g_dwEngineBuildnum;
 extern mh_dll_info_t g_EngineDLLInfo;
 extern mh_dll_info_t g_MirrorEngineDLLInfo;
 
-#define PLUGIN_VERSION "0.0.1"
+#define PLUGIN_VERSION "0.0.2"
 
 int GetDeveloperLevel();
 PVOID ConvertDllInfoSpace(PVOID addr, const mh_dll_info_t& SrcDllInfo, const mh_dll_info_t& TargetDllInfo);
