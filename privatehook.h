@@ -19,6 +19,7 @@ extern cvar_t* imv_log;
 extern cvar_t* imv_log_mode;
 extern cvar_t* imv_safety_level;
 extern cvar_t* imv_notify;
+extern cvar_t* imv_crc_storage;
 
 void Engine_FillAddress(const mh_dll_info_t& DllInfo, const mh_dll_info_t& RealDllInfo);
 void Engine_InstallHooks();
@@ -26,6 +27,7 @@ void Engine_UninstallHooks();
 
 void Command_Status();
 void Command_Reset();
+void Command_CRC();
 void IMV_OnInit();
 void IMV_OnVidInit();
 void IMV_Log(bool isMismatch, const char* fmt, ...);

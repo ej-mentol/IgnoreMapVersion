@@ -15,6 +15,7 @@ cvar_t* imv_log = nullptr;
 cvar_t* imv_log_mode = nullptr;
 cvar_t* imv_safety_level = nullptr;
 cvar_t* imv_notify = nullptr;
+cvar_t* imv_crc_storage = nullptr;
 
 static hook_t* g_pHookCRC_MapFile = nullptr;
 static uint32_t g_ServerMapCRC = 0;
@@ -95,23 +96,49 @@ void IMV_Log(bool isMismatch, const char* fmt, ...)
 	}
 }
 
-static std::string ExtractMapBaseName(const char* pszMapPath)
+static void NormalizeSlashes(std::string& path)
+{
+	for (auto& c : path)
+	{
+		if (c == '\\') c = '/';
+		c = (char)tolower((unsigned char)c);
+	}
+}
+
+static bool IMV_FileExists(const char* pszPath)
+{
+	if (!pszPath || !pszPath[0])
+		return false;
+
+	if (g_pFileSystem_HL25)
+		return g_pFileSystem_HL25->FileExists(pszPath);
+	if (g_pFileSystem)
+		return g_pFileSystem->FileExists(pszPath);
+
+	const char* pszGameDir = g_pMetaHookAPI->GetGameDirectory();
+	if (!pszGameDir || !pszGameDir[0]) pszGameDir = "svencoop";
+	char szFullPath[MAX_PATH];
+	snprintf(szFullPath, sizeof(szFullPath), "%s/%s", pszGameDir, pszPath);
+	FILE* test = fopen(szFullPath, "rb");
+	if (test) { fclose(test); return true; }
+	return false;
+}
+
+static std::string GetMapBaseName(const char* pszMapPath)
 {
 	if (!pszMapPath || !pszMapPath[0])
 		return "";
 
 	std::string path = pszMapPath;
+	NormalizeSlashes(path);
 
-	size_t lastSlash = path.find_last_of("/\\");
+	size_t lastSlash = path.find_last_of('/');
 	if (lastSlash != std::string::npos)
 		path = path.substr(lastSlash + 1);
 
 	size_t dot = path.rfind(".bsp");
 	if (dot != std::string::npos && dot == path.length() - 4)
 		path = path.substr(0, dot);
-
-	for (auto& c : path)
-		c = (char)tolower((unsigned char)c);
 
 	return path;
 }
@@ -126,6 +153,26 @@ static FileHandle_t __fastcall Hooked_FS_Open(void* pThis, int edx,
 		return g_pfnOrig_FS_Open(pThis, edx, g_ActiveAliasTo.c_str(), pOptions, pathID);
 	}
 	return g_pfnOrig_FS_Open(pThis, edx, pFileName, pOptions, pathID);
+}
+
+static void IMV_EnsureFSOpenHook(void)
+{
+	if (g_pHookFS_Open)
+		return;
+
+	bool bNeedOpenHook = (!g_MapAliases.empty()) || (imv_crc_storage && (int)imv_crc_storage->value > 0);
+	if (!bNeedOpenHook)
+		return;
+
+	void* pFS = g_pFileSystem ? (void*)g_pFileSystem : (void*)g_pFileSystem_HL25;
+	if (pFS)
+	{
+		g_pHookFS_Open = g_pMetaHookAPI->VFTHook(pFS, 0, 10,
+			(void*)Hooked_FS_Open, (void**)&g_pfnOrig_FS_Open);
+
+		if (g_pHookFS_Open)
+			IMV_Log(true, "IFileSystem::Open VFT hook installed for map aliasing & storage.\n");
+	}
 }
 
 static void Hooked_svc_serverinfo(void)
@@ -155,7 +202,7 @@ static void Hooked_svc_serverinfo(void)
 					// int32_t servernumber
 					// uint32_t mapcrc
 					g_ServerMapCRC = *reinterpret_cast<const uint32_t*>(pPayload + 8);
-					IMV_Log(true, "svc_serverinfo: extracted server Map CRC = 0x%08X (readCount=%d)\n", g_ServerMapCRC, readCount);
+					IMV_Log(false, "svc_serverinfo: extracted server Map CRC = 0x%08X\n", g_ServerMapCRC);
 				}
 			}
 		}
@@ -180,25 +227,79 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 	if (!gPrivateFuncs.CRC_MapFile)
 		return 0;
 
-	// Experimental: apply map name alias before CRC computation
+	// Experimental: apply map name alias or CRC-based storage resolution before CRC computation
 	const char* effectiveName = pszMapName;
 	std::string aliasedPath;
+	bool bStorageCandidateApplied = false;
 
-	if (g_bServerInfoActive && pszMapName && pszMapName[0] && !g_MapAliases.empty())
+	if (g_bServerInfoActive && pszMapName && pszMapName[0])
 	{
-		std::string baseName = ExtractMapBaseName(pszMapName);
-		auto it = g_MapAliases.find(baseName);
-		if (it != g_MapAliases.end())
+		// 1. Check static aliases.txt first
+		if (!g_MapAliases.empty())
 		{
-			aliasedPath = "maps/" + it->second + ".bsp";
-			g_ActiveAliasFrom = pszMapName;
-			g_ActiveAliasTo = aliasedPath;
-			effectiveName = aliasedPath.c_str();
-			IMV_Log(true, "Map alias applied: '%s' -> '%s'\n", pszMapName, effectiveName);
+			std::string serverPath = pszMapName;
+			NormalizeSlashes(serverPath);
+
+			auto it = g_MapAliases.find(serverPath);
+			if (it != g_MapAliases.end())
+			{
+				aliasedPath = it->second;
+				if (IMV_FileExists(aliasedPath.c_str()))
+				{
+					IMV_EnsureFSOpenHook();
+					g_ActiveAliasFrom = pszMapName;
+					g_ActiveAliasTo   = aliasedPath;
+					effectiveName     = aliasedPath.c_str();
+					IMV_Log(true, "Map alias applied: '%s' -> '%s'\n", pszMapName, effectiveName);
+				}
+				else
+				{
+					IMV_Log(true, "Map alias target '%s' not found, ignoring alias.\n", aliasedPath.c_str());
+					aliasedPath.clear();
+				}
+			}
+		}
+
+		// 2. If no static alias matched, try CRC-based storage: maps/<basename>_%08x.bsp (if enabled)
+		if (aliasedPath.empty() && g_ServerMapCRC != 0 && (!imv_crc_storage || (int)imv_crc_storage->value > 0))
+		{
+			std::string baseName = GetMapBaseName(pszMapName);
+			if (!baseName.empty())
+			{
+				char szCandidate[MAX_PATH];
+				snprintf(szCandidate, sizeof(szCandidate), "maps/%s_%08x.bsp", baseName.c_str(), g_ServerMapCRC);
+				if (!IMV_FileExists(szCandidate))
+				{
+					// Also test uppercase hex
+					snprintf(szCandidate, sizeof(szCandidate), "maps/%s_%08X.bsp", baseName.c_str(), g_ServerMapCRC);
+				}
+
+				if (IMV_FileExists(szCandidate))
+				{
+					IMV_EnsureFSOpenHook();
+					aliasedPath = szCandidate;
+					g_ActiveAliasFrom = pszMapName;
+					g_ActiveAliasTo   = aliasedPath;
+					effectiveName     = aliasedPath.c_str();
+					bStorageCandidateApplied = true;
+					IMV_Log(true, "CRC storage candidate found: '%s' -> '%s'\n", pszMapName, effectiveName);
+				}
+			}
 		}
 	}
 
 	int result = gPrivateFuncs.CRC_MapFile(ulCRC, effectiveName);
+
+	// If a storage candidate was used, verify its actual CRC matches server expectation
+	if (bStorageCandidateApplied && result && ulCRC && *ulCRC != g_ServerMapCRC)
+	{
+		IMV_Log(true, "CRC storage candidate '%s' has CRC 0x%08X, expected 0x%08X (mismatch). Aborting alias.\n",
+			effectiveName, *ulCRC, g_ServerMapCRC);
+		g_ActiveAliasFrom.clear();
+		g_ActiveAliasTo.clear();
+		effectiveName = pszMapName;
+		result = gPrivateFuncs.CRC_MapFile(ulCRC, effectiveName);
+	}
 
 	// Gate by active svc_serverinfo handshake and valid server CRC to prevent stale override
 	if (!g_bServerInfoActive || g_ServerMapCRC == 0 || !ulCRC)
@@ -310,20 +411,25 @@ void Command_Status(void)
 	gEngfuncs.Con_Printf("  Log Mode       : %s\n", logMode == 0 ? "Always (0)" : "Only Diff (1)");
 
 	gEngfuncs.Con_Printf("  Notify Alert   : %s\n", (imv_notify && (int)imv_notify->value > 0) ? "YES" : "NO");
+	gEngfuncs.Con_Printf("  CRC Storage    : %s\n", (imv_crc_storage && (int)imv_crc_storage->value > 0) ? "YES" : "NO");
 
-	if (!g_MapAliases.empty())
+	if (!g_MapAliases.empty() || !g_ActiveAliasFrom.empty())
 	{
-		gEngfuncs.Con_Printf("\n  Map Aliases (Experimental): %d loaded\n", (int)g_MapAliases.size());
-		for (const auto& pair : g_MapAliases)
+		gEngfuncs.Con_Printf("\n  Map Redirection (Experimental):\n");
+		if (!g_MapAliases.empty())
 		{
-			gEngfuncs.Con_Printf("    '%s' -> '%s'\n", pair.first.c_str(), pair.second.c_str());
+			gEngfuncs.Con_Printf("    Aliases Loaded : %d\n", (int)g_MapAliases.size());
+			for (const auto& pair : g_MapAliases)
+			{
+				gEngfuncs.Con_Printf("      '%s' -> '%s'\n", pair.first.c_str(), pair.second.c_str());
+			}
 		}
 		if (!g_ActiveAliasFrom.empty())
 		{
-			gEngfuncs.Con_Printf("  Active Alias   : '%s' -> '%s'\n",
+			gEngfuncs.Con_Printf("    Active Redirect: '%s' -> '%s'\n",
 				g_ActiveAliasFrom.c_str(), g_ActiveAliasTo.c_str());
 		}
-		gEngfuncs.Con_Printf("  FS_Open Hook   : %s\n", g_pHookFS_Open ? "ACTIVE" : "NOT INSTALLED");
+		gEngfuncs.Con_Printf("    FS_Open Hook   : %s\n", g_pHookFS_Open ? "ACTIVE" : "NOT INSTALLED");
 	}
 
 	gEngfuncs.Con_Printf("\n  Session Telemetry:\n");
@@ -351,6 +457,113 @@ void Command_Reset(void)
 	g_PendingNotifyMap.clear();
 
 	gEngfuncs.Con_Printf("[IMV] Session telemetry and last check data have been reset.\n");
+}
+
+void Command_CRC(void)
+{
+	const char* pszMapArg = gEngfuncs.Cmd_Argv(1);
+	std::string mapPath;
+
+	if (pszMapArg && pszMapArg[0])
+	{
+		mapPath = pszMapArg;
+		NormalizeSlashes(mapPath);
+		if (mapPath.find('/') == std::string::npos)
+			mapPath = "maps/" + mapPath;
+		if (mapPath.length() < 4 || mapPath.substr(mapPath.length() - 4) != ".bsp")
+			mapPath += ".bsp";
+	}
+	else
+	{
+		// Fallback to currently redirected map if active, otherwise currently loaded level
+		if (!g_ActiveAliasTo.empty())
+		{
+			mapPath = g_ActiveAliasTo;
+		}
+		else if (gEngfuncs.pfnGetLevelName)
+		{
+			const char* pszLevel = gEngfuncs.pfnGetLevelName();
+			if (pszLevel && pszLevel[0])
+				mapPath = pszLevel;
+		}
+	}
+
+	if (mapPath.empty())
+	{
+		gEngfuncs.Con_Printf("Usage: imv_crc <mapname>\nExample: imv_crc rust\n");
+		return;
+	}
+
+	if (!gPrivateFuncs.CRC_MapFile)
+	{
+		gEngfuncs.Con_Printf("[IMV] CRC_MapFile is not available.\n");
+		return;
+	}
+
+	uint32_t crc = 0;
+	int res = gPrivateFuncs.CRC_MapFile(&crc, mapPath.c_str());
+
+	char szLocalPath[MAX_PATH] = { 0 };
+	bool bFound = false;
+	if (g_pFileSystem_HL25)
+		bFound = (g_pFileSystem_HL25->GetLocalPath(mapPath.c_str(), szLocalPath, sizeof(szLocalPath)) != nullptr);
+	else if (g_pFileSystem)
+		bFound = (g_pFileSystem->GetLocalPath(mapPath.c_str(), szLocalPath, sizeof(szLocalPath)) != nullptr);
+
+	std::string baseName = GetMapBaseName(mapPath.c_str());
+
+	gEngfuncs.Con_Printf("\n==================== [IMV Map CRC] ====================\n");
+	gEngfuncs.Con_Printf("  Requested Map : %s\n", mapPath.c_str());
+	if (bFound && szLocalPath[0])
+		gEngfuncs.Con_Printf("  Engine Active : %s\n", szLocalPath);
+	else
+		gEngfuncs.Con_Printf("  Engine Active : (virtual / packed in archive)\n");
+
+	if (res != 0)
+	{
+		gEngfuncs.Con_Printf("  CRC32 (Hex)   : 0x%08X\n", crc);
+		gEngfuncs.Con_Printf("  CRC32 (Dec)   : %u\n", crc);
+		gEngfuncs.Con_Printf("  Storage Name  : %s_%08x.bsp\n", baseName.c_str(), crc);
+	}
+	else
+	{
+		gEngfuncs.Con_Printf("  CRC Status    : FAILED (file not found or unreadable by engine)\n");
+	}
+
+	// Scan common directory search roots for physical duplicates on disk
+	const char* pszGameDir = g_pMetaHookAPI->GetGameDirectory();
+	if (!pszGameDir || !pszGameDir[0])
+		pszGameDir = "svencoop";
+
+	std::string gameDirStr = pszGameDir;
+	NormalizeSlashes(gameDirStr);
+
+	const char* suffixes[] = { "_downloads", "_addon", "" };
+	gEngfuncs.Con_Printf("\n  Disk Locations Checked:\n");
+
+	for (const char* suffix : suffixes)
+	{
+		char candidateDisk[MAX_PATH];
+		snprintf(candidateDisk, sizeof(candidateDisk), "%s%s/maps/%s.bsp",
+			gameDirStr.c_str(), suffix, baseName.c_str());
+
+		FILE* fp = fopen(candidateDisk, "rb");
+		if (fp)
+		{
+			fseek(fp, 0, SEEK_END);
+			long fileSize = ftell(fp);
+			fclose(fp);
+
+			bool isActiveCopy = (szLocalPath[0] && strstr(szLocalPath, candidateDisk) != nullptr);
+			gEngfuncs.Con_Printf("    [FOUND] %s (%ld bytes)%s\n",
+				candidateDisk, fileSize, isActiveCopy ? " <== [ACTIVE]" : "");
+		}
+		else
+		{
+			gEngfuncs.Con_Printf("    [ - ]   %s\n", candidateDisk);
+		}
+	}
+	gEngfuncs.Con_Printf("=======================================================\n\n");
 }
 
 void IMV_LoadAliases()
@@ -389,20 +602,31 @@ void IMV_LoadAliases()
 
 	while (pParse && *pParse)
 	{
+		// Format: "local_path" "server_path"
+		// e.g. "maps/insecure01a.bsp"  "maps/insecure_01a.bsp"
 		pParse = FILESYSTEM_ANY_PARSEFILE(pParse, token, &wasquoted);
 		if (!pParse || !token[0]) break;
-		std::string key = token;
+		std::string localPath = token;
 
 		pParse = FILESYSTEM_ANY_PARSEFILE(pParse, token, &wasquoted);
-		if (!pParse || !token[0]) break;
-		std::string value = token;
+		if (!pParse || !token[0])
+		{
+			IMV_Log(true, "aliases.txt: unpaired entry '%s' at end of file, skipped.\n", localPath.c_str());
+			break;
+		}
+		std::string serverPath = token;
 
-		for (auto& c : key)
-			c = (char)tolower((unsigned char)c);
-		for (auto& c : value)
-			c = (char)tolower((unsigned char)c);
+		NormalizeSlashes(localPath);
+		NormalizeSlashes(serverPath);
 
-		g_MapAliases[std::move(key)] = std::move(value);
+		if (localPath == serverPath)
+		{
+			IMV_Log(false, "aliases.txt: alias '%s' -> '%s' is a no-op, skipped.\n", localPath.c_str(), serverPath.c_str());
+			continue;
+		}
+
+		// key = server path (what engine looks up), value = local path (what to open)
+		g_MapAliases[std::move(serverPath)] = std::move(localPath);
 	}
 
 	delete[] pBuf;
@@ -425,25 +649,16 @@ void IMV_OnInit(void)
 	imv_log_mode = gEngfuncs.pfnRegisterVariable("imv_log_mode", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 	imv_safety_level = gEngfuncs.pfnRegisterVariable("imv_safety_level", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 	imv_notify = gEngfuncs.pfnRegisterVariable("imv_notify", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
+	imv_crc_storage = gEngfuncs.pfnRegisterVariable("imv_crc_storage", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 
 	gEngfuncs.pfnAddCommand("imv_status", Command_Status);
 	gEngfuncs.pfnAddCommand("imv_reset", Command_Reset);
+	gEngfuncs.pfnAddCommand("imv_crc", Command_CRC);
 
 	IMV_LoadAliases();
 
-	// Experimental: VFT hook on IFileSystem::Open for map name aliasing
-	if (!g_MapAliases.empty())
-	{
-		void* pFS = g_pFileSystem ? (void*)g_pFileSystem : (void*)g_pFileSystem_HL25;
-		if (pFS)
-		{
-			g_pHookFS_Open = g_pMetaHookAPI->VFTHook(pFS, 0, 10,
-				(void*)Hooked_FS_Open, (void**)&g_pfnOrig_FS_Open);
-
-			if (g_pHookFS_Open)
-				IMV_Log(true, "IFileSystem::Open VFT hook installed for map aliasing.\n");
-		}
-	}
+	// Experimental: VFT hook on IFileSystem::Open for map name aliasing and CRC-based map storage
+	IMV_EnsureFSOpenHook();
 }
 
 void IMV_OnVidInit(void)
