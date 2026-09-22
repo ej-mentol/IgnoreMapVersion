@@ -16,8 +16,6 @@ extern private_funcs_t gPrivateFuncs;
 
 extern cvar_t* imv_enabled;
 extern cvar_t* imv_log;
-extern cvar_t* imv_log_mode;
-extern cvar_t* imv_safety_level;
 extern cvar_t* imv_notify;
 extern cvar_t* imv_crc_storage;
 
@@ -26,7 +24,6 @@ void Engine_InstallHooks();
 void Engine_UninstallHooks();
 
 void Command_Status();
-void Command_Reset();
 void Command_CRC();
 void IMV_OnInit();
 void IMV_OnVidInit();

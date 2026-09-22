@@ -12,8 +12,6 @@ private_funcs_t gPrivateFuncs = {};
 
 cvar_t* imv_enabled = nullptr;
 cvar_t* imv_log = nullptr;
-cvar_t* imv_log_mode = nullptr;
-cvar_t* imv_safety_level = nullptr;
 cvar_t* imv_notify = nullptr;
 cvar_t* imv_crc_storage = nullptr;
 
@@ -35,10 +33,6 @@ static hook_t* g_pHookFS_Open = nullptr;
 
 static uint32_t g_CandidateCRCMapFileRVA = 0;
 static bool g_bCRCMapFileHooked = false;
-
-// Session telemetry counters
-static int g_SessionMismatchCount = 0;
-static int g_SessionOverrideCount = 0;
 
 // Engine global net buffer pointers resolved via pattern disassembly
 // 8B 0D [imm32: &msg_readcount] -> imm32 is address of int variable msg_readcount
@@ -72,13 +66,7 @@ void IMV_Log(bool isMismatch, const char* fmt, ...)
 
 	int logType = (int)imv_log->value;
 	if (logType <= 0)
-		return;
-
-	if (imv_log_mode && (int)imv_log_mode->value == 1 && !isMismatch)
-		return;
-
-	if (logType == 1 && GetDeveloperLevel() < 1)
-		return;
+		return; // 0: Disabled completely
 
 	char szBuffer[1024];
 	va_list args;
@@ -86,13 +74,24 @@ void IMV_Log(bool isMismatch, const char* fmt, ...)
 	vsnprintf(szBuffer, sizeof(szBuffer), fmt, args);
 	va_end(args);
 
-	if (logType == 1)
+	if (logType >= 2)
 	{
-		gEngfuncs.Con_DPrintf("[IMV] %s", szBuffer);
+		// 2: Verbose - print everything to standard console
+		gEngfuncs.Con_Printf("[IMV] %s", szBuffer);
 	}
 	else
 	{
-		gEngfuncs.Con_Printf("[IMV] %s", szBuffer);
+		// 1: Smart / Standard
+		// Significant events (mismatches, overrides, redirects) go to console.
+		// Routine checks (matches, handshake bytes) go to developer console only.
+		if (isMismatch)
+		{
+			gEngfuncs.Con_Printf("[IMV] %s", szBuffer);
+		}
+		else
+		{
+			gEngfuncs.Con_DPrintf("[IMV] %s", szBuffer);
+		}
 	}
 }
 
@@ -149,7 +148,6 @@ static FileHandle_t __fastcall Hooked_FS_Open(void* pThis, int edx,
 	if (!g_ActiveAliasFrom.empty() && pFileName &&
 		!_stricmp(pFileName, g_ActiveAliasFrom.c_str()))
 	{
-		IMV_Log(true, "Alias redirect: '%s' -> '%s'\n", pFileName, g_ActiveAliasTo.c_str());
 		return g_pfnOrig_FS_Open(pThis, edx, g_ActiveAliasTo.c_str(), pOptions, pathID);
 	}
 	return g_pfnOrig_FS_Open(pThis, edx, pFileName, pOptions, pathID);
@@ -250,7 +248,7 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 					g_ActiveAliasFrom = pszMapName;
 					g_ActiveAliasTo   = aliasedPath;
 					effectiveName     = aliasedPath.c_str();
-					IMV_Log(true, "Map alias applied: '%s' -> '%s'\n", pszMapName, effectiveName);
+					IMV_Log(true, "Map redirected: '%s' -> '%s' (alias)\n", pszMapName, effectiveName);
 				}
 				else
 				{
@@ -267,12 +265,16 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 			if (!baseName.empty())
 			{
 				char szCandidate[MAX_PATH];
+				// Clean format: maps/<base>_%08x.bsp (lowercase and uppercase)
 				snprintf(szCandidate, sizeof(szCandidate), "maps/%s_%08x.bsp", baseName.c_str(), g_ServerMapCRC);
 				if (!IMV_FileExists(szCandidate))
-				{
-					// Also test uppercase hex
 					snprintf(szCandidate, sizeof(szCandidate), "maps/%s_%08X.bsp", baseName.c_str(), g_ServerMapCRC);
-				}
+
+				// Fallback to legacy maps/<base>_crc%08x.bsp
+				if (!IMV_FileExists(szCandidate))
+					snprintf(szCandidate, sizeof(szCandidate), "maps/%s_crc%08x.bsp", baseName.c_str(), g_ServerMapCRC);
+				if (!IMV_FileExists(szCandidate))
+					snprintf(szCandidate, sizeof(szCandidate), "maps/%s_crc%08X.bsp", baseName.c_str(), g_ServerMapCRC);
 
 				if (IMV_FileExists(szCandidate))
 				{
@@ -282,7 +284,7 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 					g_ActiveAliasTo   = aliasedPath;
 					effectiveName     = aliasedPath.c_str();
 					bStorageCandidateApplied = true;
-					IMV_Log(true, "CRC storage candidate found: '%s' -> '%s'\n", pszMapName, effectiveName);
+					IMV_Log(true, "Map redirected: '%s' -> '%s' (CRC storage)\n", pszMapName, effectiveName);
 				}
 			}
 		}
@@ -322,9 +324,6 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 		return result;
 	}
 
-	// Mismatch branch
-	g_SessionMismatchCount++;
-
 	if (!imv_enabled || (int)imv_enabled->value <= 0)
 	{
 		g_LastCheck.action = "Mismatch (Disabled)";
@@ -333,46 +332,32 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 		return result;
 	}
 
-	int safetyLevel = imv_safety_level ? (int)imv_safety_level->value : 1;
-
-	if (safetyLevel == 2) // Audit only
+	// Validate BSP file structure to prevent hard crashes on corrupted files
+	BSPValidationResult val = ValidateBSPFile(pMap);
+	if (val.verdict != BSPSafetyVerdict::Valid)
 	{
-		g_LastCheck.action = "Mismatch (Audit Only)";
-		IMV_Log(true, "Mismatch detected for '%s' (Client: 0x%08X, Server: 0x%08X). Audit only, no override.\n",
-			pMap, clientCRC, g_ServerMapCRC);
+		g_LastCheck.action = std::string("Mismatch (Rejected: ") + GetBSPSafetyVerdictString(val.verdict) + ")";
+		IMV_Log(true, "BSP check rejected '%s': %s. Aborting override to prevent crash.\n",
+			pMap, GetBSPSafetyVerdictString(val.verdict));
 		return result;
-	}
-	else if (safetyLevel == 0) // Force mode - skip validation
-	{
-		IMV_Log(true, "Warning: Safety level is Force (0). Bypassing BSP validation for '%s'. Desync or crash risk!\n", pMap);
-	}
-	else if (safetyLevel == 1) // Safe validation
-	{
-		BSPValidationResult val = ValidateBSPFile(pMap);
-		if (val.verdict != BSPSafetyVerdict::Valid)
-		{
-			g_LastCheck.action = std::string("Mismatch (Rejected: ") + GetBSPSafetyVerdictString(val.verdict) + ")";
-			IMV_Log(true, "Safety check rejected '%s': %s. Aborting override to prevent crash.\n",
-				pMap, GetBSPSafetyVerdictString(val.verdict));
-			return result;
-		}
 	}
 
 	// Apply override
 	*ulCRC = g_ServerMapCRC;
-	g_SessionOverrideCount++;
 	g_LastCheck.action = "Mismatch (Override Applied)";
-
-	IMV_Log(true, "Mismatch overridden for '%s': Client=0x%08X -> Server=0x%08X\n",
-		pMap, clientCRC, g_ServerMapCRC);
 
 	if (imv_notify && (int)imv_notify->value > 0)
 	{
-		gEngfuncs.Con_Printf("[IMV] WARNING: Map CRC mismatch overridden for '%s' (Client: 0x%08X, Server: 0x%08X). Potential desync risk!\n",
+		gEngfuncs.Con_Printf("[IMV] WARNING: Map CRC mismatch overridden for '%s' (Client: 0x%08X -> Server: 0x%08X). Potential desync risk!\n",
 			pMap, clientCRC, g_ServerMapCRC);
 
 		g_bPendingNotify = true;
 		g_PendingNotifyMap = pMap;
+	}
+	else
+	{
+		IMV_Log(true, "Mismatch overridden for '%s': Client=0x%08X -> Server=0x%08X\n",
+			pMap, clientCRC, g_ServerMapCRC);
 	}
 
 	return result;
@@ -380,83 +365,63 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 
 void Command_Status(void)
 {
-	gEngfuncs.Con_Printf("\n==================== [IgnoreMapVersion Status] ====================\n");
-	gEngfuncs.Con_Printf("  Plugin Version : %s\n", PLUGIN_VERSION);
-	gEngfuncs.Con_Printf("  Engine Build   : %u\n", g_dwEngineBuildnum);
-	gEngfuncs.Con_Printf("  Enabled        : %s\n", (imv_enabled && (int)imv_enabled->value > 0) ? "YES" : "NO");
-
-	if (g_bCRCMapFileHooked)
-	{
-		gEngfuncs.Con_Printf("  CRC_MapFile    : HOOKED (Active at RVA 0x%X)\n", g_CandidateCRCMapFileRVA);
-	}
-	else
-	{
-		gEngfuncs.Con_Printf("  CRC_MapFile    : NOT HOOKED\n");
-	}
-	gEngfuncs.Con_Printf("  svc_serverinfo : %s\n", gPrivateFuncs.Orig_svc_serverinfo ? "HOOKED" : "NOT HOOKED");
-
-	int safety = imv_safety_level ? (int)imv_safety_level->value : 1;
-	const char* pszSafety = "Safe (1)";
-	if (safety == 0) pszSafety = "Force (0)";
-	else if (safety == 2) pszSafety = "Audit Only (2)";
-	gEngfuncs.Con_Printf("  Safety Level   : %s\n", pszSafety);
+	bool bEnabled = (imv_enabled && (int)imv_enabled->value > 0);
 
 	int logType = imv_log ? (int)imv_log->value : 1;
-	const char* pszLog = "Developer Only (1)";
-	if (logType == 0) pszLog = "Off (0)";
-	else if (logType == 2) pszLog = "Console (2)";
-	gEngfuncs.Con_Printf("  Log Target     : %s\n", pszLog);
+	const char* pszLog = "Standard";
+	if (logType <= 0) pszLog = "Off";
+	else if (logType >= 2) pszLog = "Verbose";
 
-	int logMode = imv_log_mode ? (int)imv_log_mode->value : 1;
-	gEngfuncs.Con_Printf("  Log Mode       : %s\n", logMode == 0 ? "Always (0)" : "Only Diff (1)");
+	const char* pArg = gEngfuncs.Cmd_Argv(1);
+	bool bShowDebug = (pArg && (!_stricmp(pArg, "debug") || !_stricmp(pArg, "dev"))) || (GetDeveloperLevel() >= 1);
 
-	gEngfuncs.Con_Printf("  Notify Alert   : %s\n", (imv_notify && (int)imv_notify->value > 0) ? "YES" : "NO");
-	gEngfuncs.Con_Printf("  CRC Storage    : %s\n", (imv_crc_storage && (int)imv_crc_storage->value > 0) ? "YES" : "NO");
+	if (bShowDebug)
+		gEngfuncs.Con_Printf("\n============ [IgnoreMapVersion v%s (Debug)] ============\n", PLUGIN_VERSION);
+	else
+		gEngfuncs.Con_Printf("\n================ [IgnoreMapVersion v%s] ================\n", PLUGIN_VERSION);
+
+	gEngfuncs.Con_Printf("  Status       : %s\n", bEnabled ? "Active" : "Disabled");
+	gEngfuncs.Con_Printf("  Log Level    : %s\n", pszLog);
+	gEngfuncs.Con_Printf("  CRC Storage  : %s\n", (imv_crc_storage && (int)imv_crc_storage->value > 0) ? "Enabled" : "Disabled");
+	gEngfuncs.Con_Printf("  Notify Alert : %s\n", (imv_notify && (int)imv_notify->value > 0) ? "YES" : "NO");
 
 	if (!g_MapAliases.empty() || !g_ActiveAliasFrom.empty())
 	{
-		gEngfuncs.Con_Printf("\n  Map Redirection (Experimental):\n");
-		if (!g_MapAliases.empty())
+		gEngfuncs.Con_Printf("\n  Map Aliases  : %d loaded\n", (int)g_MapAliases.size());
+		for (const auto& pair : g_MapAliases)
 		{
-			gEngfuncs.Con_Printf("    Aliases Loaded : %d\n", (int)g_MapAliases.size());
-			for (const auto& pair : g_MapAliases)
-			{
-				gEngfuncs.Con_Printf("      '%s' -> '%s'\n", pair.first.c_str(), pair.second.c_str());
-			}
+			gEngfuncs.Con_Printf("    '%s' -> '%s'\n", pair.first.c_str(), pair.second.c_str());
 		}
 		if (!g_ActiveAliasFrom.empty())
 		{
-			gEngfuncs.Con_Printf("    Active Redirect: '%s' -> '%s'\n",
+			gEngfuncs.Con_Printf("  Active Alias : '%s' -> '%s'\n",
 				g_ActiveAliasFrom.c_str(), g_ActiveAliasTo.c_str());
 		}
-		gEngfuncs.Con_Printf("    FS_Open Hook   : %s\n", g_pHookFS_Open ? "ACTIVE" : "NOT INSTALLED");
 	}
 
-	gEngfuncs.Con_Printf("\n  Session Telemetry:\n");
-	gEngfuncs.Con_Printf("    Mismatches   : %d\n", g_SessionMismatchCount);
-	gEngfuncs.Con_Printf("    Overrides    : %d\n", g_SessionOverrideCount);
-
 	gEngfuncs.Con_Printf("\n  Last Map Check:\n");
-	gEngfuncs.Con_Printf("    Map Name     : %s\n", g_LastCheck.mapName.empty() ? "(none)" : g_LastCheck.mapName.c_str());
-	gEngfuncs.Con_Printf("    Client CRC   : 0x%08X\n", g_LastCheck.clientCRC);
-	gEngfuncs.Con_Printf("    Server CRC   : 0x%08X\n", g_LastCheck.serverCRC);
-	gEngfuncs.Con_Printf("    Action       : %s\n", g_LastCheck.action.c_str());
-	gEngfuncs.Con_Printf("===================================================================\n\n");
-}
+	if (g_LastCheck.mapName.empty())
+	{
+		gEngfuncs.Con_Printf("    (no map checks performed in this session)\n");
+	}
+	else
+	{
+		gEngfuncs.Con_Printf("    Map Name   : %s\n", g_LastCheck.mapName.c_str());
+		gEngfuncs.Con_Printf("    Client CRC : 0x%08X\n", g_LastCheck.clientCRC);
+		gEngfuncs.Con_Printf("    Server CRC : 0x%08X\n", g_LastCheck.serverCRC);
+		gEngfuncs.Con_Printf("    Action     : %s\n", g_LastCheck.action.c_str());
+	}
 
-void Command_Reset(void)
-{
-	g_LastCheck.mapName.clear();
-	g_LastCheck.clientCRC = 0;
-	g_LastCheck.serverCRC = 0;
-	g_LastCheck.action = "None";
-
-	g_SessionMismatchCount = 0;
-	g_SessionOverrideCount = 0;
-	g_bPendingNotify = false;
-	g_PendingNotifyMap.clear();
-
-	gEngfuncs.Con_Printf("[IMV] Session telemetry and last check data have been reset.\n");
+	if (bShowDebug)
+	{
+		gEngfuncs.Con_Printf("\n  [Debug Diagnostics]:\n");
+		gEngfuncs.Con_Printf("    Engine Build : %u\n", g_dwEngineBuildnum);
+		gEngfuncs.Con_Printf("    CRC_MapFile  : %s (RVA 0x%X)\n", g_bCRCMapFileHooked ? "HOOKED" : "NOT HOOKED", g_CandidateCRCMapFileRVA);
+		gEngfuncs.Con_Printf("    ServerInfo   : %s\n", gPrivateFuncs.Orig_svc_serverinfo ? "HOOKED" : "NOT HOOKED");
+		gEngfuncs.Con_Printf("    FS_Open Hook : %s\n", g_pHookFS_Open ? "ACTIVE" : "NOT INSTALLED");
+		gEngfuncs.Con_Printf("    Net Pointers : readcount=%p, data=%p\n", (void*)g_pMsgReadCount, (void*)g_pNetMessageData);
+	}
+	gEngfuncs.Con_Printf("==========================================================\n\n");
 }
 
 void Command_CRC(void)
@@ -646,13 +611,10 @@ void IMV_OnInit(void)
 
 	imv_enabled = gEngfuncs.pfnRegisterVariable("imv_enabled", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 	imv_log = gEngfuncs.pfnRegisterVariable("imv_log", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
-	imv_log_mode = gEngfuncs.pfnRegisterVariable("imv_log_mode", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
-	imv_safety_level = gEngfuncs.pfnRegisterVariable("imv_safety_level", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 	imv_notify = gEngfuncs.pfnRegisterVariable("imv_notify", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 	imv_crc_storage = gEngfuncs.pfnRegisterVariable("imv_crc_storage", "1", FCVAR_ARCHIVE | FCVAR_CLIENTDLL);
 
 	gEngfuncs.pfnAddCommand("imv_status", Command_Status);
-	gEngfuncs.pfnAddCommand("imv_reset", Command_Reset);
 	gEngfuncs.pfnAddCommand("imv_crc", Command_CRC);
 
 	IMV_LoadAliases();
