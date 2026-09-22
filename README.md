@@ -32,9 +32,7 @@ All configuration variables are archived in `config.cfg` and prefixed with `imv_
 | ConVar | Default | Description |
 | :--- | :---: | :--- |
 | `imv_enabled` | `1` | Master toggle (`1` = active, `0` = disabled). |
-| `imv_safety_level` | `1` | Validation rigor mode: <br>• `0` (**Force**): Bypasses all BSP integrity checks. Overrides CRC regardless of geometric differences. Increases risk of physics desync or client crashes.<br>• `1` (**Safe**): Checks BSP geometry lumps prior to override. Aborts override if corrupt or fundamentally incompatible structures are detected.<br>• `2` (**Audit Only**): Telemetry mode. Observes and logs CRC mismatches without modifying the CRC value. Normal engine disconnect will occur. |
-| `imv_log` | `1` | Log output destination: <br>• `0` (**Off**): Disables diagnostic logging.<br>• `1` (**Developer Only**): Prints via `Con_DPrintf`. Messages appear only when `developer` cvar is set to `1` or higher. Keeps console clean for regular gameplay.<br>• `2` (**Console**): Prints directly to standard console (`Con_Printf`). |
-| `imv_log_mode` | `1` | Log filtering policy: <br>• `0` (**Always**): Logs every map verification check, including exact matches.<br>• `1` (**Only Diff**): Logs only when a CRC mismatch or validation event occurs. |
+| `imv_log` | `1` | Diagnostic output verbosity level: <br>• `0` (**Off**): Disables all diagnostic output.<br>• `1` (**Standard**): Prints warnings, overrides, and redirects directly to console (`Con_Printf`). Routine matches and handshake telemetry route to developer console (`Con_DPrintf`, visible when `developer >= 1`). Keeps console clean for gameplay.<br>• `2` (**Verbose**): Prints all diagnostic events unconditionally to the standard console. |
 | `imv_notify` | `1` | Displays an on-screen `CenterPrint` warning alert upon spawning into the map if a CRC mismatch was overridden. |
 | `imv_crc_storage` | `1` | Enables automatic loading of CRC-indexed map variants (`maps/<name>_<crc>.bsp`). |
 
@@ -42,18 +40,19 @@ All configuration variables are archived in `config.cfg` and prefixed with `imv_
 
 ## Console Commands
 
-- `imv_status`: Outputs diagnostic telemetry to the console, including engine build, active hook RVAs, cvar settings, session counters, and details of the most recent map verification.
-- `imv_reset`: Clears session mismatch/override counters and resets the last-checked map telemetry.
+- `imv_status [debug]`: Displays current plugin status, active log level, CRC storage state, active aliases, and the last map verification result. Append `debug` (or enable `developer 1`) to view low-level engine hook diagnostics and memory addresses.
 - `imv_crc [map]`: Computes the engine CRC32 for a given map (or the currently loaded map if omitted), resolves its physical path on disk across game search paths, and outputs the suggested filename for CRC Map Storage.
 
 ---
 
 ## Logging Philosophy & Diagnostics
 
-Why are separate logging targets and modes provided?
+The plugin uses a 3-tier logging model via `imv_log`:
 
-- **Standard vs. Developer Console (`imv_log`)**: During ordinary gameplay, console output should remain clean for chat, game events, and admin messages. Setting `imv_log 1` ensures diagnostic messages only appear when debugging with `developer 1`. Setting `imv_log 2` makes all actions visible immediately for players troubleshooting connectivity.
-- **Match Filtering (`imv_log_mode`)**: On servers cycling standard maps, CRC matches occur on every transition. Setting `imv_log_mode 1` filters out matching maps, highlighting only instances where the client and server versions diverge.
+- **Silent by Default for Routine Events**: On servers cycling known maps, matches occur on every transition. In standard mode (`imv_log 1`), matches do not clutter the game console.
+- **Developer Integration**: Setting engine variable `developer 1` seamlessly reveals routine handshake logs via `Con_DPrintf` without requiring verbose plugin configuration.
+- **Safety Visibility**: Significant events (mismatch overrides, geometry rejections, map redirects) are printed to the standard console.
+- **Independent Warning Channel (`imv_notify`)**: Override alerts and on-screen desync warnings are independently toggled via `imv_notify` so players never miss a critical desync alert.
 
 ---
 
@@ -91,18 +90,12 @@ Aliases are defined in `<gamedir>/ignoremapversion/aliases.txt`, one pair per li
 
 In addition to static aliases in `aliases.txt`, the plugin supports automatic loading of map variants indexed by CRC.
 
-If a server requests `maps/<mapname>.bsp` with CRC `0x1234ABCD`, the plugin automatically checks if a file named `maps/<mapname>_1234abcd.bsp` (or uppercase) exists in the game search paths. If present:
+If a server requests `maps/<mapname>.bsp` with CRC `0x1234ABCD`, the plugin automatically checks if a file named `maps/<mapname>_1234abcd.bsp` (or uppercase, or legacy `maps/<mapname>_crc1234abcd.bsp`) exists in the game search paths. If present:
 1. The engine transparently redirects the map load to `maps/<mapname>_1234abcd.bsp`.
 2. The real CRC of the candidate file is verified against the server's expected CRC to ensure the filename was not faked or corrupted.
 3. If matching, the map loads seamlessly without triggering any mismatch alerts or geometry validation aborts.
 
 You can determine a map's CRC and suggested storage filename at any time using the `imv_crc <mapname>` console command.
-
----
-
-## Known Issues
-
-A handful of logging edge cases (mainly around `imv_log_mode` filtering) are still being worked out. Behavior elsewhere in the plugin is stable.
 
 ---
 
