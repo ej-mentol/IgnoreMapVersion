@@ -78,7 +78,7 @@ void IPluginsV4::LoadClient(cl_exportfuncs_t *pExportFuncs)
 	memcpy(&gExportfuncs, pExportFuncs, sizeof(gExportfuncs));
 
 	pExportFuncs->HUD_Init = HUD_Init;
-	pExportFuncs->HUD_VidInit = HUD_VidInit;
+	pExportFuncs->HUD_Frame = HUD_Frame;
 }
 
 void IPluginsV4::ExitGame(int iResult)
