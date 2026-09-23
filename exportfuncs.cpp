@@ -12,13 +12,9 @@ void HUD_Init(void)
 	IMV_OnInit();
 }
 
-int HUD_VidInit(void)
+void HUD_Frame(double time)
 {
-	int result = 0;
-	if (gExportfuncs.HUD_VidInit)
-	{
-		result = gExportfuncs.HUD_VidInit();
-	}
-	IMV_OnVidInit();
-	return result;
+	if (gExportfuncs.HUD_Frame)
+		gExportfuncs.HUD_Frame(time);
+	IMV_OnFrame();
 }
