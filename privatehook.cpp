@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string>
+#include <set>
 #include <unordered_map>
 
 private_funcs_t gPrivateFuncs = {};
@@ -39,6 +40,7 @@ static bool g_bCRCMapFileHooked = false;
 static int* g_pMsgReadCount = nullptr;
 // A1 [imm32: &net_message.data] -> imm32 is address of uint8_t* pointer net_message.data
 static uint8_t** g_pNetMessageData = nullptr;
+static int* g_pNetCursize = nullptr;
 
 struct IMVLastCheck
 {
@@ -59,7 +61,7 @@ int GetDeveloperLevel()
 	return 0;
 }
 
-void IMV_Log(bool isMismatch, const char* fmt, ...)
+void IMV_Log(bool printToConsole, const char* fmt, ...)
 {
 	if (!imv_log)
 		return;
@@ -76,22 +78,15 @@ void IMV_Log(bool isMismatch, const char* fmt, ...)
 
 	if (logType >= 2)
 	{
-		// 2: Verbose - print everything to standard console
-		gEngfuncs.Con_Printf("[IMV] %s", szBuffer);
+		gEngfuncs.Con_Printf("IMV: %s", szBuffer);
+	}
+	else if (printToConsole)
+	{
+		gEngfuncs.Con_Printf("IMV: %s", szBuffer);
 	}
 	else
 	{
-		// 1: Smart / Standard
-		// Significant events (mismatches, overrides, redirects) go to console.
-		// Routine checks (matches, handshake bytes) go to developer console only.
-		if (isMismatch)
-		{
-			gEngfuncs.Con_Printf("[IMV] %s", szBuffer);
-		}
-		else
-		{
-			gEngfuncs.Con_DPrintf("[IMV] %s", szBuffer);
-		}
+		gEngfuncs.Con_DPrintf("IMV: %s", szBuffer);
 	}
 }
 
@@ -142,6 +137,41 @@ static std::string GetMapBaseName(const char* pszMapPath)
 	return path;
 }
 
+static const char* IMV_FindFirst(const char* wildcard, FileFindHandle_t* handle)
+{
+	if (g_pFileSystem_HL25)
+		return g_pFileSystem_HL25->FindFirst(wildcard, handle);
+	if (g_pFileSystem)
+		return g_pFileSystem->FindFirst(wildcard, handle);
+	return nullptr;
+}
+
+static const char* IMV_FindNext(FileFindHandle_t handle)
+{
+	if (g_pFileSystem_HL25)
+		return g_pFileSystem_HL25->FindNext(handle);
+	if (g_pFileSystem)
+		return g_pFileSystem->FindNext(handle);
+	return nullptr;
+}
+
+static bool IMV_FindIsDirectory(FileFindHandle_t handle)
+{
+	if (g_pFileSystem_HL25)
+		return g_pFileSystem_HL25->FindIsDirectory(handle);
+	if (g_pFileSystem)
+		return g_pFileSystem->FindIsDirectory(handle);
+	return false;
+}
+
+static void IMV_FindClose(FileFindHandle_t handle)
+{
+	if (g_pFileSystem_HL25)
+		g_pFileSystem_HL25->FindClose(handle);
+	else if (g_pFileSystem)
+		g_pFileSystem->FindClose(handle);
+}
+
 static FileHandle_t __fastcall Hooked_FS_Open(void* pThis, int edx,
 	const char* pFileName, const char* pOptions, const char* pathID)
 {
@@ -169,7 +199,7 @@ static void IMV_EnsureFSOpenHook(void)
 			(void*)Hooked_FS_Open, (void**)&g_pfnOrig_FS_Open);
 
 		if (g_pHookFS_Open)
-			IMV_Log(true, "IFileSystem::Open VFT hook installed for map aliasing & storage.\n");
+			IMV_Log(false, "IFileSystem::Open hook installed.\n");
 	}
 }
 
@@ -182,16 +212,17 @@ static void Hooked_svc_serverinfo(void)
 	g_ActiveAliasFrom.clear();
 	g_ActiveAliasTo.clear();
 
-	if (g_pMsgReadCount && g_pNetMessageData)
+	if (g_pMsgReadCount && g_pNetMessageData && g_pNetCursize)
 	{
 		__try
 		{
 			if (*g_pNetMessageData)
 			{
 				int readCount = *g_pMsgReadCount;
+				int messageSize = *g_pNetCursize;
 
-				// Bounds check against max buffer length (65536) to prevent out-of-bounds read on truncated packet
-				if (readCount >= 0 && readCount + 12 <= NET_MAX_PAYLOAD)
+				if (messageSize >= 0 && messageSize <= NET_MAX_PAYLOAD &&
+					readCount >= 0 && readCount <= messageSize - 12)
 				{
 					const uint8_t* pPayload = (*g_pNetMessageData) + readCount;
 
@@ -248,7 +279,7 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 					g_ActiveAliasFrom = pszMapName;
 					g_ActiveAliasTo   = aliasedPath;
 					effectiveName     = aliasedPath.c_str();
-					IMV_Log(true, "Map redirected: '%s' -> '%s' (alias)\n", pszMapName, effectiveName);
+				IMV_Log(true, "Using map alias '%s' -> '%s'.\n", pszMapName, effectiveName);
 				}
 				else
 				{
@@ -284,7 +315,7 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 					g_ActiveAliasTo   = aliasedPath;
 					effectiveName     = aliasedPath.c_str();
 					bStorageCandidateApplied = true;
-					IMV_Log(true, "Map redirected: '%s' -> '%s' (CRC storage)\n", pszMapName, effectiveName);
+					IMV_Log(true, "Using CRC map '%s' -> '%s'.\n", pszMapName, effectiveName);
 				}
 			}
 		}
@@ -293,18 +324,33 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 	int result = gPrivateFuncs.CRC_MapFile(ulCRC, effectiveName);
 
 	// If a storage candidate was used, verify its actual CRC matches server expectation
-	if (bStorageCandidateApplied && result && ulCRC && *ulCRC != g_ServerMapCRC)
+	if (bStorageCandidateApplied && (!result || !ulCRC || *ulCRC != g_ServerMapCRC))
 	{
-		IMV_Log(true, "CRC storage candidate '%s' has CRC 0x%08X, expected 0x%08X (mismatch). Aborting alias.\n",
-			effectiveName, *ulCRC, g_ServerMapCRC);
+		if (result && ulCRC)
+		{
+			IMV_Log(true, "CRC storage candidate '%s' has CRC 0x%08X, expected 0x%08X (mismatch). Aborting alias.\n",
+				effectiveName, *ulCRC, g_ServerMapCRC);
+		}
+		else
+		{
+			IMV_Log(true, "CRC storage candidate '%s' could not be read. Aborting alias.\n", effectiveName);
+		}
 		g_ActiveAliasFrom.clear();
 		g_ActiveAliasTo.clear();
 		effectiveName = pszMapName;
 		result = gPrivateFuncs.CRC_MapFile(ulCRC, effectiveName);
 	}
 
+	if (!result || !ulCRC)
+	{
+		g_ActiveAliasFrom.clear();
+		g_ActiveAliasTo.clear();
+		g_bServerInfoActive = false;
+		return result;
+	}
+
 	// Gate by active svc_serverinfo handshake and valid server CRC to prevent stale override
-	if (!g_bServerInfoActive || g_ServerMapCRC == 0 || !ulCRC)
+	if (!g_bServerInfoActive || g_ServerMapCRC == 0)
 		return result;
 
 	// Reset handshake flag now that map check for this serverinfo has executed
@@ -348,7 +394,7 @@ static int __cdecl Hooked_CRC_MapFile(uint32_t *ulCRC, const char *pszMapName)
 
 	if (imv_notify && (int)imv_notify->value > 0)
 	{
-		gEngfuncs.Con_Printf("[IMV] WARNING: Map CRC mismatch overridden for '%s' (Client: 0x%08X -> Server: 0x%08X). Potential desync risk!\n",
+		gEngfuncs.Con_Printf("IMV: Warning: Map CRC mismatch overridden for '%s' (client 0x%08X, server 0x%08X). Map desynchronization is possible.\n",
 			pMap, clientCRC, g_ServerMapCRC);
 
 		g_bPendingNotify = true;
@@ -419,7 +465,8 @@ void Command_Status(void)
 		gEngfuncs.Con_Printf("    CRC_MapFile  : %s (RVA 0x%X)\n", g_bCRCMapFileHooked ? "HOOKED" : "NOT HOOKED", g_CandidateCRCMapFileRVA);
 		gEngfuncs.Con_Printf("    ServerInfo   : %s\n", gPrivateFuncs.Orig_svc_serverinfo ? "HOOKED" : "NOT HOOKED");
 		gEngfuncs.Con_Printf("    FS_Open Hook : %s\n", g_pHookFS_Open ? "ACTIVE" : "NOT INSTALLED");
-		gEngfuncs.Con_Printf("    Net Pointers : readcount=%p, data=%p\n", (void*)g_pMsgReadCount, (void*)g_pNetMessageData);
+		gEngfuncs.Con_Printf("    Net Pointers : readcount=%p, data=%p, cursize=%p\n",
+			(void*)g_pMsgReadCount, (void*)g_pNetMessageData, (void*)g_pNetCursize);
 	}
 	gEngfuncs.Con_Printf("==========================================================\n\n");
 }
@@ -440,7 +487,6 @@ void Command_CRC(void)
 	}
 	else
 	{
-		// Fallback to currently redirected map if active, otherwise currently loaded level
 		if (!g_ActiveAliasTo.empty())
 		{
 			mapPath = g_ActiveAliasTo;
@@ -461,74 +507,78 @@ void Command_CRC(void)
 
 	if (!gPrivateFuncs.CRC_MapFile)
 	{
-		gEngfuncs.Con_Printf("[IMV] CRC_MapFile is not available.\n");
+		gEngfuncs.Con_Printf("IMV: CRC_MapFile is not available.\n");
 		return;
 	}
 
-	uint32_t crc = 0;
-	int res = gPrivateFuncs.CRC_MapFile(&crc, mapPath.c_str());
-
-	char szLocalPath[MAX_PATH] = { 0 };
-	bool bFound = false;
-	if (g_pFileSystem_HL25)
-		bFound = (g_pFileSystem_HL25->GetLocalPath(mapPath.c_str(), szLocalPath, sizeof(szLocalPath)) != nullptr);
-	else if (g_pFileSystem)
-		bFound = (g_pFileSystem->GetLocalPath(mapPath.c_str(), szLocalPath, sizeof(szLocalPath)) != nullptr);
-
-	std::string baseName = GetMapBaseName(mapPath.c_str());
-
-	gEngfuncs.Con_Printf("\n==================== [IMV Map CRC] ====================\n");
-	gEngfuncs.Con_Printf("  Requested Map : %s\n", mapPath.c_str());
-	if (bFound && szLocalPath[0])
-		gEngfuncs.Con_Printf("  Engine Active : %s\n", szLocalPath);
-	else
-		gEngfuncs.Con_Printf("  Engine Active : (virtual / packed in archive)\n");
-
-	if (res != 0)
+	const std::string baseName = GetMapBaseName(mapPath.c_str());
+	if (baseName.empty())
 	{
-		gEngfuncs.Con_Printf("  CRC32 (Hex)   : 0x%08X\n", crc);
-		gEngfuncs.Con_Printf("  CRC32 (Dec)   : %u\n", crc);
-		gEngfuncs.Con_Printf("  Storage Name  : %s_%08x.bsp\n", baseName.c_str(), crc);
+		gEngfuncs.Con_Printf("IMV: Invalid map name.\n");
+		return;
 	}
-	else
+	const std::string wildcard = "maps/" + baseName + "*.bsp";
+	std::set<std::string> variants;
+	variants.insert(mapPath);
+
+	FileFindHandle_t findHandle = FILESYSTEM_INVALID_FIND_HANDLE;
+	const char* foundName = IMV_FindFirst(wildcard.c_str(), &findHandle);
+	while (foundName)
 	{
-		gEngfuncs.Con_Printf("  CRC Status    : FAILED (file not found or unreadable by engine)\n");
-	}
-
-	// Scan common directory search roots for physical duplicates on disk
-	const char* pszGameDir = g_pMetaHookAPI->GetGameDirectory();
-	if (!pszGameDir || !pszGameDir[0])
-		pszGameDir = "svencoop";
-
-	std::string gameDirStr = pszGameDir;
-	NormalizeSlashes(gameDirStr);
-
-	const char* suffixes[] = { "_downloads", "_addon", "" };
-	gEngfuncs.Con_Printf("\n  Disk Locations Checked:\n");
-
-	for (const char* suffix : suffixes)
-	{
-		char candidateDisk[MAX_PATH];
-		snprintf(candidateDisk, sizeof(candidateDisk), "%s%s/maps/%s.bsp",
-			gameDirStr.c_str(), suffix, baseName.c_str());
-
-		FILE* fp = fopen(candidateDisk, "rb");
-		if (fp)
+		if (!IMV_FindIsDirectory(findHandle))
 		{
-			fseek(fp, 0, SEEK_END);
-			long fileSize = ftell(fp);
-			fclose(fp);
+			std::string candidate = foundName;
+			for (char& c : candidate)
+			{
+				if (c == '\\') c = '/';
+			}
+			if (candidate.find('/') == std::string::npos)
+				candidate = "maps/" + candidate;
 
-			bool isActiveCopy = (szLocalPath[0] && strstr(szLocalPath, candidateDisk) != nullptr);
-			gEngfuncs.Con_Printf("    [FOUND] %s (%ld bytes)%s\n",
-				candidateDisk, fileSize, isActiveCopy ? " <== [ACTIVE]" : "");
+			NormalizeSlashes(candidate);
+			const std::string& normalizedCandidate = candidate;
+			const size_t slash = normalizedCandidate.find_last_of('/');
+			const std::string filename = normalizedCandidate.substr(slash == std::string::npos ? 0 : slash + 1);
+			const size_t extension = filename.rfind(".bsp");
+			if (extension != std::string::npos && extension == filename.length() - 4)
+			{
+				const std::string stem = filename.substr(0, extension);
+				if (stem == baseName || (stem.size() > baseName.size() &&
+					stem.compare(0, baseName.size(), baseName) == 0 && stem[baseName.size()] == '_'))
+				{
+					variants.insert(normalizedCandidate);
+				}
+			}
+		}
+		foundName = IMV_FindNext(findHandle);
+	}
+	if (findHandle != FILESYSTEM_INVALID_FIND_HANDLE)
+		IMV_FindClose(findHandle);
+
+	gEngfuncs.Con_Printf("\nIMV: Map CRC variants for '%s'\n", mapPath.c_str());
+	uint32_t requestedCRC = 0;
+	bool requestedCRCFound = false;
+	for (const std::string& variant : variants)
+	{
+		uint32_t variantCRC = 0;
+		const int variantResult = gPrivateFuncs.CRC_MapFile(&variantCRC, variant.c_str());
+		if (variantResult)
+		{
+			gEngfuncs.Con_Printf("  0x%08X  %s\n", variantCRC, variant.c_str());
+			if (variant == mapPath)
+			{
+				requestedCRC = variantCRC;
+				requestedCRCFound = true;
+			}
 		}
 		else
-		{
-			gEngfuncs.Con_Printf("    [ - ]   %s\n", candidateDisk);
-		}
+			gEngfuncs.Con_Printf("  unreadable  %s\n", variant.c_str());
 	}
-	gEngfuncs.Con_Printf("=======================================================\n\n");
+
+	if (requestedCRCFound)
+		gEngfuncs.Con_Printf("IMV: CRC storage name for the requested file: maps/%s_%08x.bsp\n\n", baseName.c_str(), requestedCRC);
+	else
+		gEngfuncs.Con_Printf("IMV: The requested map could not be read by the engine.\n\n");
 }
 
 void IMV_LoadAliases()
@@ -598,7 +648,7 @@ void IMV_LoadAliases()
 
 	if (!g_MapAliases.empty())
 	{
-		IMV_Log(true, "Loaded %d map alias(es) from '%s'\n", (int)g_MapAliases.size(), szPath);
+			IMV_Log(false, "Loaded %d map alias(es) from '%s'.\n", (int)g_MapAliases.size(), szPath);
 	}
 }
 
@@ -623,18 +673,25 @@ void IMV_OnInit(void)
 	IMV_EnsureFSOpenHook();
 }
 
-void IMV_OnVidInit(void)
+void IMV_OnFrame(void)
 {
-	if (g_bPendingNotify && imv_notify && (int)imv_notify->value > 0)
+	if (!g_bPendingNotify)
+		return;
+	if (!imv_notify || (int)imv_notify->value <= 0)
 	{
-		if (gEngfuncs.pfnCenterPrint)
-		{
-			char szNotify[256];
-			snprintf(szNotify, sizeof(szNotify), "[IMV] Warning: Map CRC mismatch overridden for '%s'!\nLocal map version differs from server.", g_PendingNotifyMap.c_str());
-			gEngfuncs.pfnCenterPrint(szNotify);
-		}
 		g_bPendingNotify = false;
+		return;
 	}
+	if (!gEngfuncs.pfnCenterPrint)
+	{
+		g_bPendingNotify = false;
+		return;
+	}
+
+	char szNotify[256];
+	snprintf(szNotify, sizeof(szNotify), "IMV: Warning: Map CRC mismatch overridden for '%s'.\nLocal map version differs from the server.", g_PendingNotifyMap.c_str());
+	gEngfuncs.pfnCenterPrint(szNotify);
+	g_bPendingNotify = false;
 }
 
 // Verified 20-byte pattern from svenint for CRC_MapFile
@@ -691,6 +748,9 @@ void Engine_FillAddress(const mh_dll_info_t& DllInfo, const mh_dll_info_t& RealD
 {
 	gPrivateFuncs.CRC_MapFile = nullptr;
 	g_CandidateCRCMapFileRVA = 0;
+	g_pMsgReadCount = nullptr;
+	g_pNetMessageData = nullptr;
+	g_pNetCursize = nullptr;
 
 	// 1. Primary: Verified RVA 0x41940 for Sven Co-op 5.26 (build 10257) from svenint gamedata
 	const ULONG_PTR knownRVA = 0x41940;
@@ -701,7 +761,7 @@ void Engine_FillAddress(const mh_dll_info_t& DllInfo, const mh_dll_info_t& RealD
 		{
 			gPrivateFuncs.CRC_MapFile = reinterpret_cast<decltype(gPrivateFuncs.CRC_MapFile)>(pKnown);
 			g_CandidateCRCMapFileRVA = static_cast<uint32_t>(knownRVA);
-			IMV_Log(true, "CRC_MapFile resolved at verified RVA 0x%X (pattern matched).\n", g_CandidateCRCMapFileRVA);
+			IMV_Log(false, "CRC_MapFile found at RVA 0x%X.\n", g_CandidateCRCMapFileRVA);
 		}
 	}
 
@@ -717,7 +777,7 @@ void Engine_FillAddress(const mh_dll_info_t& DllInfo, const mh_dll_info_t& RealD
 				ULONG_PTR rva = (ULONG_PTR)pResolved - (ULONG_PTR)RealDllInfo.ImageBase;
 				gPrivateFuncs.CRC_MapFile = pResolved;
 				g_CandidateCRCMapFileRVA = static_cast<uint32_t>(rva);
-				IMV_Log(true, "CRC_MapFile resolved via pattern scan (RVA: 0x%X).\n", g_CandidateCRCMapFileRVA);
+				IMV_Log(false, "CRC_MapFile found by pattern scan at RVA 0x%X.\n", g_CandidateCRCMapFileRVA);
 			}
 		}
 	}
@@ -747,19 +807,21 @@ void Engine_FillAddress(const mh_dll_info_t& DllInfo, const mh_dll_info_t& RealD
 
 		uint8_t* pNetCursizeImm = *reinterpret_cast<uint8_t**>(pMSG_ReadByte + 11);
 		uint8_t* pNetCursizeReal = (uint8_t*)ConvertDllInfoSpace(pNetCursizeImm, DllInfo, RealDllInfo);
-		if (pNetCursizeReal && IsEngineDataPointer(pNetCursizeReal - 8, RealDllInfo))
+		if (pNetCursizeReal && IsEngineDataPointer(pNetCursizeReal, RealDllInfo) &&
+			IsEngineDataPointer(pNetCursizeReal - 8, RealDllInfo))
 		{
 			// In sizebuf_t, offsetof(cursize) == 16, offsetof(data) == 8.
 			// Therefore, pointer to 'data' member (uint8_t*) is at (pNetCursizeReal - 8).
 			g_pNetMessageData = reinterpret_cast<uint8_t**>(pNetCursizeReal - 8);
+			g_pNetCursize = reinterpret_cast<int*>(pNetCursizeReal);
 		}
 		else
 		{
-			IMV_Log(true, "net_message.data pointer %p is outside engine data bounds.\n", pNetCursizeReal ? pNetCursizeReal - 8 : nullptr);
+			IMV_Log(true, "net_message pointer %p is outside engine data bounds.\n", pNetCursizeReal ? pNetCursizeReal - 8 : nullptr);
 		}
 
-		IMV_Log(true, "Network message pointers resolved: msg_readcount=%p, net_message.data=%p\n",
-			g_pMsgReadCount, g_pNetMessageData);
+		IMV_Log(false, "Network message pointers: readcount=%p, data=%p, cursize=%p.\n",
+			g_pMsgReadCount, g_pNetMessageData, g_pNetCursize);
 	}
 	else
 	{
