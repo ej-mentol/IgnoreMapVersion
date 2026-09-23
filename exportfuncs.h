@@ -3,4 +3,4 @@
 #include <metahook.h>
 
 void HUD_Init(void);
-int HUD_VidInit(void);
+void HUD_Frame(double time);
