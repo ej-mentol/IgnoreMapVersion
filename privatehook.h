@@ -26,6 +26,6 @@ void Engine_UninstallHooks();
 void Command_Status();
 void Command_CRC();
 void IMV_OnInit();
-void IMV_OnVidInit();
-void IMV_Log(bool isMismatch, const char* fmt, ...);
+void IMV_OnFrame();
+void IMV_Log(bool printToConsole, const char* fmt, ...);
 void IMV_LoadAliases();
